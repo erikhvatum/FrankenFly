@@ -20,6 +20,8 @@ models. Do not claim biologically calibrated walking from anatomical checks.
 | `LegDynamics.swift` | modeled articulated joints, foot contact and resulting grounded body motion |
 | `BrainView.swift` | brain window: point clouds, click-to-stimulate, spike flashes |
 | `Environment.swift` | permission-free senses: `WindowSense` (ledges/looms), circadian curve, user idle, thermal tempo |
+| `Autopilot.swift` | MechJeb modes (SAS/GoTo/Orbit/Land/scare-yield) mixing BrainSignals |
+| `KeyboardPilot.swift` | WASD manual stick on same channels; `CGEventSource.keyState` (permission-free) |
 | `etl.py` | raw Codex dumps → `data/brain_points.json` + `data/circuit.json` |
 | `etl_malecns.py` | public MaleCNS Feather tables → `data/locomotor_circuit.json` + `data/locomotor_report.json` |
 | `data/` | FlyWire CC BY-NC 4.0 and MaleCNS CC BY 4.0 data; see `DATA_LICENSE.md` and `LOCOMOTOR_PROVENANCE.md` |

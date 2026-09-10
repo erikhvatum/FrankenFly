@@ -1,5 +1,6 @@
 // Autopilot.swift — MechJeb-style guidance computer that mixes/overrides
 // BrainSignals on top of the LIF brain. Commands controls; never teleports.
+// Coordinator stack: scare/GF > KeyboardPilot (held) > Autopilot > brain.
 
 import Foundation
 import CoreGraphics

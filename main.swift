@@ -8,7 +8,7 @@
 //         ./DesktopFly --snapshot out.png [--top] [--flying] [--beetle]  (offscreen body)
 //         ./DesktopFly --brainshot out.png (offscreen brain window render)
 //         ./DesktopFly --simtest           (headless circuit test: spontaneous + loom)
-//         ./DesktopFly --gototest          (headless autopilot GoTo ledge arrival)
+//         ./DesktopFly --gototest          (headless autopilot/keyboard mixer checks)
 
 import Cocoa
 import SceneKit
@@ -741,6 +741,45 @@ func runGoToTest() {
               String(format: "turnBias=%.2f", mixed.turnBias))
     }
 
+    // Keyboard stick overrides autopilot while held; scare still wins.
+    do {
+        let fly = Fly(at: .zero)
+        fly.state = .walking
+        fly.speed = 30
+        fly.heading = 0
+        let ap = Autopilot()
+        ap.engageGoTo(CGPoint(x: 200, y: 0))
+        let kb = KeyboardPilot()
+        var brain = BrainSignals()
+        brain.walkDrive = 0.05
+        let guided = ap.mix(brain, fly: fly, dt: dt)
+        kb.testStick = KeyboardPilot.Stick(turnBias: -0.8, walkDrive: 0.9)
+        let piloted = kb.mix(guided)
+        check("Keyboard overrides autopilot turnBias while held",
+              piloted.turnBias < -0.5 && piloted.walkDrive > 0.7,
+              String(format: "turnBias=%.2f walkDrive=%.2f", piloted.turnBias, piloted.walkDrive))
+        kb.testStick = nil
+        let released = kb.mix(guided)
+        check("Keyboard release restores autopilot stick",
+              abs(released.turnBias - guided.turnBias) < 0.001
+                && abs(released.walkDrive - guided.walkDrive) < 0.001,
+              String(format: "turnBias=%.2f walkDrive=%.2f", released.turnBias, released.walkDrive))
+        brain.escape = true
+        let scared = ap.mix(brain, fly: fly, dt: dt)
+        kb.testStick = KeyboardPilot.Stick(turnBias: 0.9, walkDrive: 1.0, escape: false)
+        let scareWins = kb.mix(scared)
+        check("Scare/GF beats keyboard stick",
+              scareWins.escape == true && scareWins.walkDrive < 0.1,
+              String(format: "escape=%@ walkDrive=%.2f", "\(scareWins.escape)", scareWins.walkDrive))
+        kb.testStick = KeyboardPilot.Stick(escape: true, wingDrive: 1.0)
+        brain.escape = false
+        brain.nervous = 0
+        let takeoff = kb.mix(brain)
+        check("Space/F stick pulses escape + wingDrive",
+              takeoff.escape && takeoff.wingDrive >= 0.9,
+              String(format: "escape=%@ wingDrive=%.2f", "\(takeoff.escape)", takeoff.wingDrive))
+    }
+
     print(failures == 0 ? "ALL GOTO TESTS PASS" : "\(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }
@@ -789,6 +828,7 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var fpsWindowStart: TimeInterval = 0
     private let signalBuilder = SignalBuilder()
     let autopilot = Autopilot()
+    let keyboard = KeyboardPilot()
     private var msAccumulator: Double = 0
     private let simulationClock = SimulationClock()
     private var prevMouse: CGPoint?
@@ -1030,8 +1070,9 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             var s = signalBuilder.make(sim, dt: dt)
             s.tempo = tempo
             s.sleep = sleepy
-            // Guidance computer on top of the LIF brain — commands, no teleports.
+            // Stick mixer: scare/GF > keyboard (held) > autopilot > brain.
             s = autopilot.mix(s, fly: first, dt: dt)
+            s = keyboard.mix(s)
             signals = s
         }
 
@@ -1228,6 +1269,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         apMenu.addItem(apItem("Land", #selector(autopilotLand)))
         apMenu.addItem(apItem("Scare-yield Standby", #selector(autopilotScareYield)))
         menu.addItem(apRoot)
+        let keyHint = NSMenuItem(title: KeyboardPilot.menuHint, action: nil, keyEquivalent: "")
+        keyHint.isEnabled = false
+        menu.addItem(keyHint)
         let move = item("Move to Next Display", #selector(moveToNextDisplay), "d")
         menu.addItem(move)
         moveDisplayItem = move
