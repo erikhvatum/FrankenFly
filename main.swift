@@ -8,6 +8,7 @@
 //         ./DesktopFly --snapshot out.png [--top] [--flying] [--beetle]  (offscreen body)
 //         ./DesktopFly --brainshot out.png (offscreen brain window render)
 //         ./DesktopFly --simtest           (headless circuit test: spontaneous + loom)
+//         ./DesktopFly --gototest          (headless autopilot GoTo ledge arrival)
 
 import Cocoa
 import SceneKit
@@ -650,6 +651,100 @@ func runBehaviorTest() {
     exit(failures == 0 ? 0 : 1)
 }
 
+// MARK: - GoTo autopilot test (headless body + guidance mixer)
+
+func runGoToTest() {
+    print("test RNG: FNV-1a(test name), LCG32")
+    TestRandom.reset("gototest")
+    let bounds = CGSize(width: 1512, height: 982)
+    let dt = SimulationClock.tick
+    var failures = 0
+
+    func check(_ name: String, _ ok: Bool, _ detail: String) {
+        if !ok { failures += 1 }
+        print("\(ok ? "PASS" : "FAIL")  \(name): \(detail)")
+    }
+
+    // Autopilot steers BrainSignals only — fly must walk to a ledge under hysteresis.
+    do {
+        let fly = Fly(at: CGPoint(x: -220, y: -120))
+        fly.state = .walking
+        fly.speed = 40
+        fly.heading = 0
+        fly.stateAge = 1.0
+        let ledge = Ledge(y: 40, x0: -120, x1: 120, id: 7)
+        fly.terrain = [ledge]
+        let ap = Autopilot()
+        ap.engageGoTo(ledge: ledge)
+        let mid = CGPoint(x: (ledge.x0 + ledge.x1) * 0.5, y: ledge.y)
+        let timeout: CGFloat = 30
+        var t: CGFloat = 0
+        var reached = false
+        while t < timeout {
+            t += dt
+            var brain = BrainSignals()
+            // Mild spontaneous brain noise — mixer must still dominate.
+            brain.walkDrive = 0.05
+            brain.groomDrive = 0.2
+            brain.arousal = 0.4
+            let signals = ap.mix(brain, fly: fly, dt: dt)
+            fly.update(dt: dt, bounds: bounds, mouse: nil, signals: signals)
+            let dist = hypot(fly.pos.x - mid.x, fly.pos.y - mid.y)
+            if fly.ledge?.id == ledge.id || dist < 45 {
+                reached = true
+                break
+            }
+        }
+        let dist = hypot(fly.pos.x - mid.x, fly.pos.y - mid.y)
+        check("GoTo reaches ledge within \(Int(timeout))s",
+              reached,
+              String(format: "t=%.1fs state=%@ pos=(%.0f,%.0f) dist=%.0f ledge=%@",
+                     t, "\(fly.state)", fly.pos.x, fly.pos.y, dist,
+                     fly.ledge.map { "\($0.id)" } ?? "nil"))
+    }
+
+    // Scare-yield: GF / loom abort must pass through and win over guidance.
+    do {
+        let fly = Fly(at: CGPoint(x: 0, y: 0))
+        fly.state = .walking
+        fly.speed = 30
+        fly.heading = 0
+        fly.scareCooldown = 0
+        let ap = Autopilot()
+        ap.engageGoTo(CGPoint(x: 200, y: 0))
+        var brain = BrainSignals()
+        brain.escape = true
+        let mixed = ap.mix(brain, fly: fly, dt: dt)
+        check("Scare-yield: GF escape passes through",
+              mixed.escape == true,
+              "escape=\(mixed.escape) walkDrive=\(String(format: "%.2f", mixed.walkDrive))")
+        brain.escape = false
+        brain.nervous = 0.55
+        let mixed2 = ap.mix(brain, fly: fly, dt: dt)
+        check("Scare-yield: hot loom yields guidance",
+              mixed2.nervous > 0.40 && mixed2.walkDrive < 0.1,
+              String(format: "nervous=%.2f walkDrive=%.2f", mixed2.nervous, mixed2.walkDrive))
+    }
+
+    // SAS holds heading via turnBias sign.
+    do {
+        let fly = Fly(at: .zero)
+        fly.state = .walking
+        fly.speed = 30
+        fly.heading = 0.6
+        let ap = Autopilot()
+        ap.engageSAS(heading: 0)
+        let brain = BrainSignals()
+        let mixed = ap.mix(brain, fly: fly, dt: dt)
+        check("SAS commands negative turnBias toward locked heading",
+              mixed.turnBias < -0.1,
+              String(format: "turnBias=%.2f", mixed.turnBias))
+    }
+
+    print(failures == 0 ? "ALL GOTO TESTS PASS" : "\(failures) FAILURES")
+    exit(failures == 0 ? 0 : 1)
+}
+
 // MARK: - Signals
 
 // Converts sim population rates into body commands. Shared by the app loop
@@ -693,6 +788,7 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private var fpsFrames = 0
     private var fpsWindowStart: TimeInterval = 0
     private let signalBuilder = SignalBuilder()
+    let autopilot = Autopilot()
     private var msAccumulator: Double = 0
     private let simulationClock = SimulationClock()
     private var prevMouse: CGPoint?
@@ -746,6 +842,38 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
         }
     }
     func escapeTest() { enqueue { $0.loomOverride = 0.6 } }
+
+    func toggleAutopilot() {
+        enqueue { c in
+            guard let fly = c.flies.first else { return }
+            if c.autopilot.engaged {
+                c.autopilot.disengage()
+                return
+            }
+            // Default engage: GoTo nearest window ledge, else SAS heading hold.
+            if let L = nearestLedge(to: fly.pos, in: c.terrain) {
+                c.autopilot.engageGoTo(ledge: L)
+            } else {
+                c.autopilot.engageSAS(heading: fly.heading)
+            }
+        }
+    }
+
+    func setAutopilotMode(_ apply: @escaping (Autopilot, Fly, [Ledge]) -> Void) {
+        enqueue { c in
+            guard let fly = c.flies.first else { return }
+            apply(c.autopilot, fly, c.terrain)
+        }
+    }
+
+    func autopilotStatus() -> String {
+        // mode is only mutated on the render thread via enqueue; reading it here
+        // is best-effort for the menu label.
+        return autopilot.engaged
+            ? "Disengage Autopilot (\(autopilot.modeTitle))"
+            : "Engage Autopilot"
+    }
+
     func setBodyForm(_ form: BodyForm) {
         enqueue { c in
             guard BODY_FORM != form else { return }
@@ -902,6 +1030,8 @@ final class Coordinator: NSObject, SCNSceneRendererDelegate {
             var s = signalBuilder.make(sim, dt: dt)
             s.tempo = tempo
             s.sleep = sleepy
+            // Guidance computer on top of the LIF brain — commands, no teleports.
+            s = autopilot.mix(s, fly: first, dt: dt)
             signals = s
         }
 
@@ -921,6 +1051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         // only offer the display hop when there is somewhere to hop to
         moveDisplayItem?.isHidden = NSScreen.screens.count < 2
+        autopilotMenuItem?.title = coordinator?.autopilotStatus() ?? "Engage Autopilot"
     }
 
     var window: NSWindow!
@@ -941,6 +1072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var brainHintItem: NSMenuItem?
     var bodyItem: NSMenuItem?
     var requestedBody: BodyForm = BODY_FORM
+    var autopilotMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.main else { fatalError("no screen") }
@@ -1080,6 +1212,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(hint)
         brainHintItem = hint
         menu.addItem(item("Escape Test (loom)", #selector(escapeTest), "e"))
+        let apMenu = NSMenu()
+        let apRoot = NSMenuItem(title: "Engage Autopilot", action: nil, keyEquivalent: "")
+        apRoot.submenu = apMenu
+        autopilotMenuItem = apRoot
+        func apItem(_ title: String, _ sel: Selector) -> NSMenuItem {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            it.target = self
+            return it
+        }
+        apMenu.addItem(apItem("Engage / Disengage", #selector(toggleAutopilot)))
+        apMenu.addItem(apItem("SAS (heading hold)", #selector(autopilotSAS)))
+        apMenu.addItem(apItem("GoTo Nearest Ledge", #selector(autopilotGoTo)))
+        apMenu.addItem(apItem("Orbit Nearest Ledge", #selector(autopilotOrbit)))
+        apMenu.addItem(apItem("Land", #selector(autopilotLand)))
+        apMenu.addItem(apItem("Scare-yield Standby", #selector(autopilotScareYield)))
+        menu.addItem(apRoot)
         let move = item("Move to Next Display", #selector(moveToNextDisplay), "d")
         menu.addItem(move)
         moveDisplayItem = move
@@ -1121,6 +1269,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         brainFullscreenItem?.title = wc.isFullscreen ? "Exit Fullscreen Brain" : "Fullscreen Brain"
     }
     @objc func escapeTest() { coordinator.escapeTest() }
+    @objc func toggleAutopilot() { coordinator.toggleAutopilot() }
+    @objc func autopilotSAS() {
+        coordinator.setAutopilotMode { ap, fly, _ in ap.engageSAS(heading: fly.heading) }
+    }
+    @objc func autopilotGoTo() {
+        coordinator.setAutopilotMode { ap, fly, terrain in
+            if let L = nearestLedge(to: fly.pos, in: terrain) { ap.engageGoTo(ledge: L) }
+            else { ap.engageSAS(heading: fly.heading) }
+        }
+    }
+    @objc func autopilotOrbit() {
+        coordinator.setAutopilotMode { ap, fly, terrain in
+            if let L = nearestLedge(to: fly.pos, in: terrain) {
+                ap.engageOrbit(center: CGPoint(x: (L.x0 + L.x1) * 0.5, y: L.y), radius: 90)
+            } else {
+                ap.engageOrbit(center: fly.pos, radius: 90)
+            }
+        }
+    }
+    @objc func autopilotLand() {
+        coordinator.setAutopilotMode { ap, _, _ in ap.engageLand() }
+    }
+    @objc func autopilotScareYield() {
+        coordinator.setAutopilotMode { ap, _, _ in ap.engageScareYield() }
+    }
     @objc func addFly() { coordinator.addFly() }
     @objc func removeFly() { coordinator.removeFly() }
     @objc func scareAll() { coordinator.scareAll() }
@@ -1158,6 +1331,9 @@ if args.contains("--behaviortest") {
 }
 if args.contains("--locomotortest") {
     exit(runLocomotorTests() ? 0 : 1)
+}
+if args.contains("--gototest") {
+    runGoToTest()
 }
 
 let app = NSApplication.shared
